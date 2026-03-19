@@ -5,116 +5,109 @@ const cheerio = require('cheerio');
 
 const app = express();
 app.use(cors());
+app.use(express.json());
 
-// Health check
-app.get('/', (req, res) => {
-  res.json({ status: 'ok' });
-});
+const ANIMEKAI_BASE = 'https://animekai.to';
 
-// Debug — raw HTML from AnimeKai search
-app.get('/debug', async (req, res) => {
-  const { title } = req.query;
-  if (!title) return res.status(400).json({ error: 'title required' });
+const HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+  'Accept': 'text/html,application/xhtml+xml',
+  'Accept-Language': 'en-US,en;q=0.5',
+  'Connection': 'keep-alive'
+};
 
+async function searchAnimeKai(title) {
   try {
-    const r = await axios.get(`https://animekai.to/browser?keyword=${encodeURIComponent(title)}`, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'text/html'
-      },
-      timeout: 10000
-    });
-    res.send('<pre>' + r.data.substring(0, 6000) + '</pre>');
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Embed endpoint
-app.get('/embed', async (req, res) => {
-  const { title, ep } = req.query;
-  if (!title || !ep) return res.status(400).json({ error: 'title and ep required' });
-
-  try {
-    // Step 1 — Search AnimeKai
-    const searchRes = await axios.get(`https://animekai.to/browser?keyword=${encodeURIComponent(title)}`, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'text/html'
-      },
-      timeout: 10000
-    });
-
-    const $s = cheerio.load(searchRes.data);
+    const html = await axios.get(
+      `${ANIMEKAI_BASE}/browser?keyword=${encodeURIComponent(title)}`,
+      { headers: HEADERS, timeout: 10000 }
+    );
+    const $ = cheerio.load(html.data);
     let slug = null;
 
-    $s('a').each((i, el) => {
-      const href = $s(el).attr('href') || '';
-      if (href.match(/^\/[a-z0-9-]+-\d+$/) && !slug) {
+    $('a').each((i, el) => {
+      const href = $(el).attr('href') || '';
+      if (!slug && href.match(/^\/[a-z0-9-]+-\d+$/)) {
         slug = href.replace('/', '');
       }
     });
 
-    if (!slug) return res.status(404).json({ error: 'Anime not found on AnimeKai', html_preview: searchRes.data.substring(0, 1000) });
+    console.log(`[S3] Search "${title}" → slug: ${slug}`);
+    return slug;
+  } catch (err) {
+    console.error('[S3] searchAnimeKai error:', err.message);
+    return null;
+  }
+}
 
-    // Step 2 — Get anime page
-    const animeRes = await axios.get(`https://animekai.to/${slug}`, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'text/html'
-      },
-      timeout: 10000
+async function getEpisodes(slug) {
+  try {
+    const html = await axios.get(`${ANIMEKAI_BASE}/${slug}`, {
+      headers: HEADERS, timeout: 10000
     });
+    const $ = cheerio.load(html.data);
+    const episodes = [];
 
-    const $a = cheerio.load(animeRes.data);
-    let epHref = null;
+    const selectors = [
+      'a.ep-item', '.ep-list a', 'a[data-num]',
+      '.ssl-item.ep-item', '.episodes-ul li a'
+    ];
 
-    $a('a').each((i, el) => {
-      const num = $a(el).attr('data-num');
-      const href = $a(el).attr('href') || '';
-      if (num && parseInt(num) === parseInt(ep) && href.includes('watch') && !epHref) {
-        epHref = href;
-      }
-    });
+    for (const selector of selectors) {
+      $(selector).each((i, el) => {
+        const epNum = $(el).attr('data-num') || $(el).attr('data-number');
+        const epId = $(el).attr('data-id') || $(el).attr('href');
+        if (epNum && epId) {
+          episodes.push({
+            number: parseInt(epNum),
+            id: epId,
+            title: $(el).attr('title') || `Episode ${epNum}`
+          });
+        }
+      });
+      if (episodes.length > 0) break;
+    }
 
-    if (!epHref) return res.status(404).json({ error: `Episode ${ep} not found`, slug });
+    console.log(`[S3] Found ${episodes.length} episodes for "${slug}"`);
+    return episodes;
+  } catch (err) {
+    console.error('[S3] getEpisodes error:', err.message);
+    return [];
+  }
+}
 
-    // Step 3 — Get embed from watch page
-    const watchUrl = epHref.startsWith('http') ? epHref : `https://animekai.to${epHref}`;
-    const watchRes = await axios.get(watchUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'text/html',
-        'Referer': 'https://animekai.to'
-      },
-      timeout: 10000
-    });
+async function getEmbedUrl(epId) {
+  try {
+    const url = epId.startsWith('http')
+      ? epId
+      : `${ANIMEKAI_BASE}${epId.startsWith('/') ? '' : '/'}${epId}`;
+    const html = await axios.get(url, { headers: HEADERS, timeout: 10000 });
+    const $ = cheerio.load(html.data);
+    const iframe = $('iframe').first().attr('src');
+    if (iframe) return iframe.startsWith('http') ? iframe : `https:${iframe}`;
+    return url;
+  } catch (err) {
+    console.error('[S3] getEmbedUrl error:', err.message);
+    return null;
+  }
+}
 
-    const $w = cheerio.load(watchRes.data);
-    const iframe = $w('iframe').first().attr('src');
+app.get('/', (req, res) => {
+  res.json({ status: 'RK Scraper running OK' });
+});
 
-    if (!iframe) return res.status(404).json({ error: 'No embed found', watchUrl });
-
-    const embedUrl = iframe.startsWith('http') ? iframe : `https:${iframe}`;
-    res.json({ embedUrl, slug, episode: ep });
-
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+app.get('/debug', async (req, res) => {
+  const { title } = req.query;
+  if (!title) return res.status(400).json({ error: 'title required' });
+  try {
+    const r = await axios.get(
+      `${ANIMEKAI_BASE}/browser?keyword=${encodeURIComponent(title)}`,
+      { headers: HEADERS, timeout: 10000 }
+    );
+    res.send('<pre>' + r.data.substring(0, 6000) + '</pre>');
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, '0.0.0.0', () => console.log(`Running on ${PORT}`));
-```
-
----
-
-The key differences from before:
-- **No `cloudscraper`** — removed completely
-- **Pinned `cheerio` to `rc.10`** — the rc.12 version was breaking on Railway
-- **Much simpler code** — less dependencies = less crash risk
-- **Added `html_preview`** in error responses so we can debug if selectors fail
-
-Replace both files on GitHub, wait for Railway to redeploy, then visit:
-```
-https://rk-scraper-production.up.railway.app/
+app.get('/search', async (r
