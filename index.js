@@ -1,6 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const cloudscraper = require('cloudscraper');
+const axios = require('axios');
 const cheerio = require('cheerio');
 
 const app = express();
@@ -9,40 +9,48 @@ app.use(express.json());
 
 const ANIMEKAI_BASE = 'https://animekai.to';
 
+const HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+  'Accept-Language': 'en-US,en;q=0.5',
+  'Accept-Encoding': 'gzip, deflate, br',
+  'Connection': 'keep-alive',
+  'Upgrade-Insecure-Requests': '1',
+  'Sec-Fetch-Dest': 'document',
+  'Sec-Fetch-Mode': 'navigate',
+  'Sec-Fetch-Site': 'none',
+  'Cache-Control': 'max-age=0'
+};
+
 async function searchAnimeKai(title) {
   try {
-    const html = await cloudscraper.get(`${ANIMEKAI_BASE}/browser?keyword=${encodeURIComponent(title)}`);
-    const $ = cheerio.load(html);
+    const res = await axios.get(`${ANIMEKAI_BASE}/browser?keyword=${encodeURIComponent(title)}`, {
+      headers: HEADERS,
+      timeout: 10000
+    });
+    const $ = cheerio.load(res.data);
 
     let slug = null;
-
-    // Try multiple possible selectors
     const selectors = [
-      'a.item',
-      'a.film-name',
-      '.flw-item a',
-      '.film_list-wrap .flw-item a',
-      'a[href*="/watch"]',
-      '.anif-block-ul li a',
-      'a.dynamic-name',
-      '.film-detail a'
+      'a.item', 'a.film-name', '.flw-item a',
+      'a[href*="/watch"]', 'a.dynamic-name', '.film-detail a',
+      '.anif-block-ul li a', 'a[href*="-"]'
     ];
 
     for (const selector of selectors) {
       const el = $(selector).first();
       if (el.length) {
         const href = el.attr('href');
-        if (href) {
+        if (href && href !== '/') {
           slug = href.replace(/^\//, '').split('?')[0];
-          console.log(`[S3] Found slug with selector "${selector}": ${slug}`);
+          console.log(`[S3] Found slug "${slug}" via selector "${selector}"`);
           break;
         }
       }
     }
 
-    // Log the HTML snippet for debugging
     if (!slug) {
-      console.log('[S3] Could not find slug. HTML snippet:', html.substring(0, 2000));
+      console.log('[S3] No slug found. Page snippet:', res.data.substring(0, 1500));
     }
 
     return slug;
@@ -54,22 +62,21 @@ async function searchAnimeKai(title) {
 
 async function getEpisodes(slug) {
   try {
-    const html = await cloudscraper.get(`${ANIMEKAI_BASE}/${slug}`);
-    const $ = cheerio.load(html);
-
+    const res = await axios.get(`${ANIMEKAI_BASE}/${slug}`, {
+      headers: HEADERS,
+      timeout: 10000
+    });
+    const $ = cheerio.load(res.data);
     const episodes = [];
 
-    const epSelectors = [
-      'a.ep-item',
-      '.ep-list a',
-      '.episodes-ul li a',
-      'a[data-num]',
-      '.ssl-item.ep-item'
+    const selectors = [
+      'a.ep-item', '.ep-list a', 'a[data-num]',
+      '.ssl-item.ep-item', '.episodes-ul li a'
     ];
 
-    for (const selector of epSelectors) {
+    for (const selector of selectors) {
       $(selector).each((i, el) => {
-        const epNum = $(el).attr('data-num') || $(el).attr('data-number') || $(el).text().trim();
+        const epNum = $(el).attr('data-num') || $(el).attr('data-number');
         const epId = $(el).attr('data-id') || $(el).attr('href');
         if (epNum && epId) {
           episodes.push({
@@ -79,88 +86,3 @@ async function getEpisodes(slug) {
           });
         }
       });
-      if (episodes.length > 0) {
-        console.log(`[S3] Found ${episodes.length} episodes with selector "${selector}"`);
-        break;
-      }
-    }
-
-    return episodes;
-  } catch (err) {
-    console.error('[S3] getEpisodes error:', err.message);
-    return [];
-  }
-}
-
-async function getEmbedUrl(epId) {
-  try {
-    const url = epId.startsWith('http') ? epId : `${ANIMEKAI_BASE}${epId.startsWith('/') ? '' : '/'}${epId}`;
-    const html = await cloudscraper.get(url);
-    const $ = cheerio.load(html);
-
-    const iframe = $('iframe').first().attr('src');
-    if (iframe) return iframe.startsWith('http') ? iframe : `https:${iframe}`;
-
-    return url;
-  } catch (err) {
-    console.error('[S3] getEmbedUrl error:', err.message);
-    return null;
-  }
-}
-
-// Health check
-app.get('/', (req, res) => {
-  res.json({ status: 'RK Scraper running' });
-});
-
-// Debug route — see raw HTML from AnimeKai search
-app.get('/debug', async (req, res) => {
-  const { title } = req.query;
-  if (!title) return res.status(400).json({ error: 'title required' });
-  try {
-    const html = await cloudscraper.get(`${ANIMEKAI_BASE}/browser?keyword=${encodeURIComponent(title)}`);
-    res.send(`<pre>${html.substring(0, 5000)}</pre>`);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Search
-app.get('/search', async (req, res) => {
-  const { title } = req.query;
-  if (!title) return res.status(400).json({ error: 'title is required' });
-  const slug = await searchAnimeKai(title);
-  if (!slug) return res.status(404).json({ error: 'Anime not found' });
-  res.json({ slug });
-});
-
-// Episodes
-app.get('/episodes', async (req, res) => {
-  const { title } = req.query;
-  if (!title) return res.status(400).json({ error: 'title is required' });
-  const slug = await searchAnimeKai(title);
-  if (!slug) return res.status(404).json({ error: 'Anime not found on AnimeKai' });
-  const episodes = await getEpisodes(slug);
-  res.json({ slug, episodes });
-});
-
-// Embed
-app.get('/embed', async (req, res) => {
-  const { title, ep } = req.query;
-  if (!title || !ep) return res.status(400).json({ error: 'title and ep are required' });
-  const slug = await searchAnimeKai(title);
-  if (!slug) return res.status(404).json({ error: 'Anime not found on AnimeKai' });
-  const episodes = await getEpisodes(slug);
-  const episode = episodes.find(e => e.number === parseInt(ep));
-  if (!episode) return res.status(404).json({ error: `Episode ${ep} not found` });
-  const embedUrl = await getEmbedUrl(episode.id);
-  res.json({ embedUrl, episode });
-});
-
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`RK Scraper running on port ${PORT}`));
-```
-
-After saving on GitHub, Railway will **auto-redeploy** in about 1 minute. Then go to:
-```
-https://rk-scraper-production.up.railway.app/debug?title=Jujutsu Kaisen
