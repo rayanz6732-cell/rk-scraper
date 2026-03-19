@@ -12,13 +12,3 @@
     "cheerio": "^1.0.0-rc.12"
   }
 }
-```
-
-After saving both files Railway will auto-redeploy. Then visit:
-```
-https://rk-scraper-production.up.railway.app/
-```
-
-If it says `RK Scraper running ✅` it's stable. Then try:
-```
-https://rk-scraper-production.up.railway.app/debug?title=Jujutsu Kaisen
